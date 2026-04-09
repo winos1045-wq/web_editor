@@ -45,11 +45,15 @@ async def list_files(path: str = "/"):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-
 @app.get("/api/file")
 async def read_file(path: str):
     try:
         p = Path(path).resolve()
+        # Follow symlinks to the final target
+        if p.is_symlink():
+            p = p.readlink().resolve()
+        if not p.exists():
+            return JSONResponse({"error": "Path not found"}, status_code=404)
         if not p.is_file():
             return JSONResponse({"error": "Not a file"}, status_code=400)
         if p.stat().st_size > 2 * 1024 * 1024:  # 2MB limit
@@ -59,7 +63,6 @@ async def read_file(path: str):
         return JSONResponse({"path": str(p), "content": content, "ext": ext})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 @app.post("/api/file")
 async def write_file(request: Request):
@@ -558,14 +561,35 @@ HTML_TEMPLATE = r"""
     function updateSize() { sbSize.textContent = term.cols + '×' + term.rows; }
 
     // ── WebSocket ────────────────────────────────────────────
-    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var socket = new WebSocket(proto + '//' + location.host + '/ws');
-    socket.binaryType = 'arraybuffer';
+var socket = new WebSocket(proto + '//' + location.host + '/ws');
+socket.binaryType = 'arraybuffer';
 
-    socket.onopen = function () {
-        setConnected(true); updateSize();
-        setTimeout(function () { sendResize(term.cols, term.rows); }, 50);
-    };
+// Keep-alive: send a null byte every 30 seconds to prevent Render idle timeout
+var keepAliveInterval = null;
+
+socket.onopen = function () {
+    setConnected(true); updateSize();
+    setTimeout(function () { sendResize(term.cols, term.rows); }, 50);
+    // Start keep-alive pings
+    if (keepAliveInterval) clearInterval(keepAliveInterval);
+    keepAliveInterval = setInterval(function() {
+        if (socket.readyState === WebSocket.OPEN) {
+            socket.send('\x00');  // Null byte ignored by shell
+        }
+    }, 30000); // every 30 seconds
+};
+
+socket.onclose = function () {
+    setConnected(false);
+    term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
+    tabLabel.textContent = 'bash (closed)';
+    if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+    }
+};
+
+// The rest (onmessage, onerror) stays exactly the same.
     socket.onmessage = function (event) {
         if (event.data instanceof ArrayBuffer) { term.write(new Uint8Array(event.data)); }
         else { term.write(event.data); }
@@ -936,16 +960,31 @@ class TerminalSession:
         self.pid = None
         self._read_task = None
 
-    async def start(self, cmd: str = "bash"):
-        loop = asyncio.get_running_loop()
+async def start(self, cmd: str = "bash"):
+    loop = asyncio.get_running_loop()
+    try:
         self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            os.environ["TERM"] = "xterm-256color"
-            args = shlex.split(cmd)
-            os.execvp(args[0], args)
-        else:
-            self._set_raw_mode(self.fd)
-            self._read_task = asyncio.create_task(self._read_pty_output())
+    except OSError as e:
+        # Fallback: try with /bin/sh if bash fails or PTY unavailable
+        print(f"PTY fork failed: {e}, falling back to sh")
+        cmd = "/bin/sh"
+        try:
+            self.pid, self.fd = pty.fork()
+        except OSError as e2:
+            raise RuntimeError("Could not create PTY session") from e2
+
+    if self.pid == 0:
+        os.environ["TERM"] = "xterm-256color"
+        # Use shell's name from cmd
+        shell_path = cmd.split()[0]
+        try:
+            os.execvp(shell_path, [shell_path])
+        except FileNotFoundError:
+            # Ultimate fallback
+            os.execvp("/bin/sh", ["/bin/sh"])
+    else:
+        self._set_raw_mode(self.fd)
+        self._read_task = asyncio.create_task(self._read_pty_output())
 
     def _set_raw_mode(self, fd: int):
         try:
