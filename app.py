@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-Web Shell - Single file implementation with styled dark UI + File Explorer + Monaco Editor
-Run:   python app.py
-Visit: http://localhost:8000
+Web Shell – E2B Edition
+Replaces the local PTY with an E2B cloud sandbox PTY.
+
+Install deps:
+    pip install fastapi uvicorn e2b
+
+Set your API key before running:
+    export E2B_API_KEY="your_key_here"
+
+Run:
+    python app.py
+Visit:
+    http://localhost:8000
 """
 
 import asyncio
 import json
 import os
-import pty
-import shlex
-import signal
 import struct
-import termios
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -20,66 +26,98 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.requests import Request
 import uvicorn
 
+# ── E2B ──────────────────────────────────────────────────────────────────────
+from e2b import AsyncSandbox
+
+try:
+    from e2b.sandbox.pty.main import PtySize
+except ImportError:
+    # Fallback for older SDK layouts
+    from e2b import PtySize  # type: ignore
+
 app = FastAPI()
 
-# ── File API ──────────────────────────────────────────────────────────────────
+# One shared sandbox for all connections (created on startup, killed on shutdown)
+_sandbox: AsyncSandbox | None = None
+
+
+@app.on_event("startup")
+async def startup():
+    global _sandbox
+    api_key = os.environ.get("E2B_API_KEY")
+    if not api_key:
+        print("[WARN] E2B_API_KEY not set – sandbox creation will likely fail.")
+    _sandbox = await AsyncSandbox.create(
+        timeout=3600,   # 1-hour max (Pro: 24 h)
+        api_key=api_key,
+    )
+    print(f"[E2B] Sandbox ready: {_sandbox.sandbox_id}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _sandbox
+    if _sandbox:
+        await _sandbox.kill()
+        print("[E2B] Sandbox killed.")
+
+
+def get_sandbox() -> AsyncSandbox:
+    if _sandbox is None:
+        raise RuntimeError("Sandbox not initialised yet")
+    return _sandbox
+
+
+# ── File API (proxied through E2B filesystem) ─────────────────────────────────
 
 @app.get("/api/files")
 async def list_files(path: str = "/"):
+    sbx = get_sandbox()
     try:
-        p = Path(path).resolve()
-        if not p.exists():
-            return JSONResponse({"error": "Path not found"}, status_code=404)
+        entries_raw = await sbx.filesystem.list(path)
         entries = []
-        for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-            try:
-                entries.append({
-                    "name": item.name,
-                    "path": str(item),
-                    "is_dir": item.is_dir(),
-                    "size": item.stat().st_size if item.is_file() else 0,
-                })
-            except PermissionError:
-                pass
-        return JSONResponse({"path": str(p), "entries": entries})
+        for item in sorted(entries_raw, key=lambda x: (not x.is_dir, x.name.lower())):
+            entries.append({
+                "name": item.name,
+                "path": item.path,
+                "is_dir": item.is_dir,
+                "size": getattr(item, "size", 0) or 0,
+            })
+        return JSONResponse({"path": path, "entries": entries})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 @app.get("/api/file")
 async def read_file(path: str):
+    sbx = get_sandbox()
     try:
-        p = Path(path).resolve()
-        # Follow symlinks to the final target
-        if p.is_symlink():
-            p = p.readlink().resolve()
-        if not p.exists():
-            return JSONResponse({"error": "Path not found"}, status_code=404)
-        if not p.is_file():
-            return JSONResponse({"error": "Not a file"}, status_code=400)
-        if p.stat().st_size > 2 * 1024 * 1024:  # 2MB limit
-            return JSONResponse({"error": "File too large (> 2MB)"}, status_code=400)
-        content = p.read_text(errors="replace")
-        ext = p.suffix.lstrip(".").lower()
-        return JSONResponse({"path": str(p), "content": content, "ext": ext})
+        content = await sbx.filesystem.read(path)
+        # read() may return bytes or str depending on SDK version
+        if isinstance(content, (bytes, bytearray)):
+            content = content.decode("utf-8", errors="replace")
+        ext = Path(path).suffix.lstrip(".").lower()
+        return JSONResponse({"path": path, "content": content, "ext": ext})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 @app.post("/api/file")
 async def write_file(request: Request):
+    sbx = get_sandbox()
     try:
         body = await request.json()
         path = body.get("path")
         content = body.get("content", "")
         if not path:
             return JSONResponse({"error": "No path"}, status_code=400)
-        p = Path(path).resolve()
-        p.write_text(content)
-        return JSONResponse({"ok": True, "path": str(p)})
+        await sbx.filesystem.write(path, content)
+        return JSONResponse({"ok": True, "path": path})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+# ── HTML (unchanged UI) ────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -87,7 +125,7 @@ HTML_TEMPLATE = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Web Shell</title>
+    <title>Web Shell · E2B</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
     <style>
         *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -294,7 +332,7 @@ HTML_TEMPLATE = r"""
         <div id="tabs">
             <div class="tab active" data-tab="terminal">
                 <div class="tab-icon terminal"></div>
-                <span id="tab-label">bash</span>
+                <span id="tab-label">e2b · bash</span>
                 <div class="tab-close" data-close="terminal">×</div>
             </div>
             <div class="tab-add" title="New tab" id="tab-add-btn">+</div>
@@ -403,14 +441,14 @@ HTML_TEMPLATE = r"""
                 <div class="sb-indicator" id="sb-indicator"></div>
                 <span id="sb-status">Disconnected</span>
             </div>
-            <div class="sb-item" id="sb-pid" style="display:none">bash · PID —</div>
+            <div class="sb-item" id="sb-pid" style="display:none">e2b sandbox · bash</div>
         </div>
         <div class="sb-right">
             <div class="sb-item sb-cursor" id="sb-cursor">Ln —, Col —</div>
             <div class="sb-item" id="sb-size">—×—</div>
             <div class="sb-item">UTF-8</div>
             <div class="sb-item">xterm-256color</div>
-            <div class="sb-item">WebSocket</div>
+            <div class="sb-item">E2B Cloud</div>
         </div>
     </div>
 
@@ -435,9 +473,9 @@ HTML_TEMPLATE = r"""
     // ── State ──────────────────────────────────────────────
     var state = {
         explorerOpen: false,
-        activeTab: 'terminal',    // 'terminal' | file path
+        activeTab: 'terminal',
         explorerPath: '/',
-        openFiles: {},            // path -> { content, savedContent, monacoModel }
+        openFiles: {},
         activeFile: null,
         expandedDirs: {},
         monacoEditor: null,
@@ -466,7 +504,6 @@ HTML_TEMPLATE = r"""
             scrollbar: { vertical: 'auto', horizontal: 'auto' },
         });
 
-        // Override Monaco background to #000000
         monaco.editor.defineTheme('shell-dark', {
             base: 'vs-dark',
             inherit: true,
@@ -490,14 +527,12 @@ HTML_TEMPLATE = r"""
         });
         monaco.editor.setTheme('shell-dark');
 
-        // Cursor position in status bar
         state.monacoEditor.onDidChangeCursorPosition(function(e) {
             var sbCursor = document.getElementById('sb-cursor');
             sbCursor.textContent = 'Ln ' + e.position.lineNumber + ', Col ' + e.position.column;
             sbCursor.classList.add('visible');
         });
 
-        // Mark unsaved on change
         state.monacoEditor.onDidChangeModelContent(function() {
             if (state.activeFile) {
                 var f = state.openFiles[state.activeFile];
@@ -550,8 +585,8 @@ HTML_TEMPLATE = r"""
     function setConnected(on) {
         if (on) {
             connDot.classList.add('connected'); connLabel.classList.add('connected');
-            connLabel.textContent = 'Connected';
-            sbIndicator.classList.add('connected'); sbStatus.textContent = 'bash · running';
+            connLabel.textContent = 'Connected · E2B';
+            sbIndicator.classList.add('connected'); sbStatus.textContent = 'e2b sandbox · bash · running';
         } else {
             connDot.classList.remove('connected'); connLabel.classList.remove('connected');
             connLabel.textContent = 'Disconnected';
@@ -561,54 +596,39 @@ HTML_TEMPLATE = r"""
     function updateSize() { sbSize.textContent = term.cols + '×' + term.rows; }
 
     // ── WebSocket ────────────────────────────────────────────
-var socket = new WebSocket(proto + '//' + location.host + '/ws');
-socket.binaryType = 'arraybuffer';
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var socket = new WebSocket(proto + '//' + location.host + '/ws');
+    socket.binaryType = 'arraybuffer';
 
-// Keep-alive: send a null byte every 30 seconds to prevent Render idle timeout
-var keepAliveInterval = null;
-
-socket.onopen = function () {
-    setConnected(true); updateSize();
-    setTimeout(function () { sendResize(term.cols, term.rows); }, 50);
-    // Start keep-alive pings
-    if (keepAliveInterval) clearInterval(keepAliveInterval);
-    keepAliveInterval = setInterval(function() {
-        if (socket.readyState === WebSocket.OPEN) {
-            socket.send('\x00');  // Null byte ignored by shell
-        }
-    }, 30000); // every 30 seconds
-};
-
-socket.onclose = function () {
-    setConnected(false);
-    term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
-    tabLabel.textContent = 'bash (closed)';
-    if (keepAliveInterval) {
-        clearInterval(keepAliveInterval);
-        keepAliveInterval = null;
-    }
-};
-
-// The rest (onmessage, onerror) stays exactly the same.
+    socket.onopen = function () {
+        setConnected(true); updateSize();
+        setTimeout(function () { sendResize(term.cols, term.rows); }, 50);
+    };
     socket.onmessage = function (event) {
         if (event.data instanceof ArrayBuffer) { term.write(new Uint8Array(event.data)); }
         else { term.write(event.data); }
     };
     socket.onclose = function () {
         setConnected(false);
-        term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
-        tabLabel.textContent = 'bash (closed)';
+        term.write('\r\n\x1b[31m[E2B session closed]\x1b[0m\r\n');
+        tabLabel.textContent = 'e2b · bash (closed)';
     };
     socket.onerror = function () { term.write('\r\n\x1b[31m[WebSocket error]\x1b[0m\r\n'); };
 
     function sendResize(cols, rows) {
         if (socket.readyState !== WebSocket.OPEN) return;
-        var buf = new Uint8Array(8);
+        // 4-byte little-endian: cols(u16) rows(u16)
+        var buf = new Uint8Array(4);
         var view = new DataView(buf.buffer);
-        view.setUint16(0, cols, true); view.setUint16(2, rows, true);
+        view.setUint16(0, cols, true);
+        view.setUint16(2, rows, true);
         socket.send(buf);
     }
-    term.onData(function (data) { if (socket.readyState === WebSocket.OPEN) socket.send(new TextEncoder().encode(data)); });
+
+    term.onData(function (data) {
+        if (socket.readyState === WebSocket.OPEN)
+            socket.send(new TextEncoder().encode(data));
+    });
     term.onResize(function (s) { sendResize(s.cols, s.rows); updateSize(); });
     window.addEventListener('resize', function () { fitAddon.fit(); });
 
@@ -635,7 +655,6 @@ socket.onclose = function () {
         document.getElementById('terminal-wrap').style.display = 'none';
         document.getElementById('editor-wrap').classList.add('visible');
         highlightTab(filePath);
-
         if (!state.monacoReady) { state._pendingFile = filePath; return; }
         openFileInEditor(filePath);
     }
@@ -724,7 +743,6 @@ socket.onclose = function () {
         }
     }
 
-    // terminal tab click
     document.querySelector('.tab[data-tab="terminal"]').addEventListener('click', function(e) {
         if (e.target.classList.contains('tab-close')) return;
         switchToTerminal();
@@ -752,7 +770,6 @@ socket.onclose = function () {
         }).catch(function(e) { console.error('Save error:', e); });
     }
 
-    // Ctrl+S / Cmd+S
     document.addEventListener('keydown', function(e) {
         if ((e.ctrlKey || e.metaKey) && e.key === 's') {
             if (state.activeFile) { e.preventDefault(); saveCurrentFile(); }
@@ -801,19 +818,15 @@ socket.onclose = function () {
                 if (data.error) { tree.innerHTML = '<div class="tree-loader" style="color:#f87171">' + data.error + '</div>'; return; }
                 renderTree(tree, data.entries, 0);
             })
-            .catch(function(e) { tree.innerHTML = '<div class="tree-loader" style="color:#f87171">Error loading</div>'; });
+            .catch(function() { tree.innerHTML = '<div class="tree-loader" style="color:#f87171">Error loading</div>'; });
     }
 
     function renderTree(container, entries, depth) {
         container.innerHTML = '';
-        if (entries.length === 0) {
-            container.innerHTML = '<div class="tree-loader">Empty</div>';
-            return;
-        }
+        if (entries.length === 0) { container.innerHTML = '<div class="tree-loader">Empty</div>'; return; }
         entries.forEach(function(entry) {
             var item = createTreeItem(entry, depth);
             container.appendChild(item);
-            // If dir was expanded before, re-render its children
             if (entry.is_dir && state.expandedDirs[entry.path]) {
                 var subContainer = document.createElement('div');
                 subContainer.id = 'subtree-' + btoa(entry.path).replace(/[^a-zA-Z0-9]/g, '');
@@ -847,23 +860,18 @@ socket.onclose = function () {
         name.className = 'tree-name';
         name.textContent = entry.name;
 
-        item.appendChild(indent);
-        item.appendChild(arrow);
-        item.appendChild(icon);
-        item.appendChild(name);
+        item.appendChild(indent); item.appendChild(arrow); item.appendChild(icon); item.appendChild(name);
 
         if (entry.is_dir) {
             item.addEventListener('click', function() {
                 var subId = 'subtree-' + btoa(entry.path).replace(/[^a-zA-Z0-9]/g, '');
                 if (state.expandedDirs[entry.path]) {
-                    // collapse
                     delete state.expandedDirs[entry.path];
                     arrow.classList.remove('open');
                     icon.innerHTML = folderIcon(false);
                     var sub = document.getElementById(subId);
                     if (sub) sub.remove();
                 } else {
-                    // expand
                     state.expandedDirs[entry.path] = true;
                     arrow.classList.add('open');
                     icon.innerHTML = folderIcon(true);
@@ -905,10 +913,7 @@ socket.onclose = function () {
     }
 
     function openFile(filePath) {
-        if (state.openFiles[filePath]) {
-            addEditorTab(filePath);
-            return;
-        }
+        if (state.openFiles[filePath]) { addEditorTab(filePath); return; }
         fetch('/api/file?path=' + encodeURIComponent(filePath))
             .then(function(r) { return r.json(); })
             .then(function(data) {
@@ -951,125 +956,66 @@ async def get_terminal():
     return HTML_TEMPLATE
 
 
-# ── PTY session ──────────────────────────────────────────────────────────────
-
-class TerminalSession:
-    def __init__(self, websocket: WebSocket):
-        self.websocket = websocket
-        self.fd = None
-        self.pid = None
-        self._read_task = None
-
-async def start(self, cmd: str = "bash"):
-    loop = asyncio.get_running_loop()
-    try:
-        self.pid, self.fd = pty.fork()
-    except OSError as e:
-        # Fallback: try with /bin/sh if bash fails or PTY unavailable
-        print(f"PTY fork failed: {e}, falling back to sh")
-        cmd = "/bin/sh"
-        try:
-            self.pid, self.fd = pty.fork()
-        except OSError as e2:
-            raise RuntimeError("Could not create PTY session") from e2
-
-    if self.pid == 0:
-        os.environ["TERM"] = "xterm-256color"
-        # Use shell's name from cmd
-        shell_path = cmd.split()[0]
-        try:
-            os.execvp(shell_path, [shell_path])
-        except FileNotFoundError:
-            # Ultimate fallback
-            os.execvp("/bin/sh", ["/bin/sh"])
-    else:
-        self._set_raw_mode(self.fd)
-        self._read_task = asyncio.create_task(self._read_pty_output())
-
-    def _set_raw_mode(self, fd: int):
-        try:
-            attr = termios.tcgetattr(fd)
-            attr[3] = attr[3] & ~termios.ICANON & ~termios.ISIG
-            attr[3] = attr[3] | termios.ECHO
-            attr[6][termios.VMIN] = 1
-            attr[6][termios.VTIME] = 0
-            termios.tcsetattr(fd, termios.TCSANOW, attr)
-        except Exception:
-            pass
-
-    async def _read_pty_output(self):
-        loop = asyncio.get_event_loop()
-        while True:
-            try:
-                data = await loop.run_in_executor(None, os.read, self.fd, 1024)
-                if not data:
-                    break
-                await self.websocket.send_bytes(data)
-            except (OSError, asyncio.CancelledError):
-                break
-
-    async def write(self, data: bytes):
-        if self.fd:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, os.write, self.fd, data)
-
-    async def resize(self, cols: int, rows: int):
-        if self.fd:
-            try:
-                import fcntl
-                winsize = struct.pack("HHHH", rows, cols, 0, 0)
-                fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
-            except Exception:
-                pass
-
-    async def close(self):
-        if self._read_task:
-            self._read_task.cancel()
-            try:
-                await self._read_task
-            except asyncio.CancelledError:
-                pass
-        if self.pid:
-            try:
-                os.kill(self.pid, signal.SIGTERM)
-                os.waitpid(self.pid, 0)
-            except Exception:
-                pass
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except Exception:
-                pass
-
-
-# ── WebSocket endpoint ────────────────────────────────────────────────────────
+# ── E2B PTY WebSocket ─────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    session = TerminalSession(websocket)
+    sbx = get_sandbox()
+
+    loop = asyncio.get_event_loop()
+    pty_handle = None
+    pty_pid: int | None = None
+
+    # Callback: E2B PTY → browser
+    async def on_data(data: bytes) -> None:
+        try:
+            await websocket.send_bytes(data)
+        except Exception:
+            pass
+
+    # Sync wrapper required by E2B SDK (it calls on_data from a thread)
+    def on_data_sync(output) -> None:
+        raw: bytes = output.data if hasattr(output, "data") else bytes(output)
+        asyncio.run_coroutine_threadsafe(on_data(raw), loop)
 
     try:
-        await session.start(cmd="bash")
+        # Create the PTY inside the E2B sandbox
+        pty_handle = await sbx.pty.create(
+            size=PtySize(cols=220, rows=50),
+            on_data=on_data_sync,
+            timeout=0,          # keep alive indefinitely
+            user="user",
+        )
+        pty_pid = pty_handle.pid
 
+        # Main receive loop: browser → E2B PTY
         while True:
             message = await websocket.receive()
 
-            if "text" in message:
-                await session.write(message["text"].encode())
-            elif "bytes" in message:
-                data = message["bytes"]
-                if len(data) == 8:
-                    cols = struct.unpack("<H", data[0:2])[0]
-                    rows = struct.unpack("<H", data[2:4])[0]
-                    await session.resize(cols, rows)
+            if "bytes" in message:
+                data: bytes = message["bytes"]
+                if len(data) == 4:
+                    # Resize packet: cols(u16 LE) rows(u16 LE)
+                    cols = struct.unpack_from("<H", data, 0)[0]
+                    rows = struct.unpack_from("<H", data, 2)[0]
+                    await sbx.pty.resize(pty_pid, PtySize(cols=cols, rows=rows))
                 else:
-                    await session.write(data)
+                    await sbx.pty.send_stdin(pty_pid, data)
+
+            elif "text" in message:
+                await sbx.pty.send_stdin(pty_pid, message["text"].encode())
 
     except WebSocketDisconnect:
         pass
+    except Exception as exc:
+        print(f"[WS] Error: {exc}")
     finally:
-        await session.close()
+        if pty_pid is not None:
+            try:
+                await sbx.pty.kill(pty_pid)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
